@@ -7,6 +7,7 @@ substitutions:
   _RUNTIME: nodejs20
   _MEMORY: 1024MB
   _TIMEOUT: 540s
+  _PUBLIC_BASE_URL: https://europe-west1-arnacon-nl.cloudfunctions.net/elead
 
 steps:
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
@@ -25,7 +26,8 @@ steps:
       - --memory=${_MEMORY}
       - --timeout=${_TIMEOUT}
       - --set-env-vars=CHAIN_ID=11155111,URL_RPC=https://sepolia.drpc.org,PUBLIC_BASE_URL=${_PUBLIC_BASE_URL},ELEAD_HTML_URL=https://cellact.github.io/Elead-HTML/,CLAIM_PROVIDER=Elead
-      - --set-secrets=PRIVATE_KEY=elead-private-key:latest
+      # add when Secret Manager is ready:
+      # - --set-secrets=PRIVATE_KEY=elead-private-key:latest
 
 options:
   logging: CLOUD_LOGGING_ONLY
