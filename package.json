@@ -1,0 +1,16 @@
+{
+  "name": "elead-backend-gcp",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "functions-framework --target=elead --port=8080"
+  },
+  "dependencies": {
+    "@google-cloud/functions-framework": "^3.4.5",
+    "arnacon-sdk": "^1.0.41",
+    "@semaphore-protocol/proof": "^4.14.2",
+    "dotenv": "^17.2.0",
+    "ethers": "^5.8.0"
+  }
+}

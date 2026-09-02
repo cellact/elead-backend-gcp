@@ -1,0 +1,10 @@
+.gcloudignore
+.git
+.gitignore
+node_modules
+data
+.env
+.arnacon
+deploy.json
+cloudbuild.yaml
+*.md

@@ -1,0 +1,5 @@
+{
+  "timeout": "540s",
+  "allow_unauthenticated": true,
+  "memory": "1024MB"
+}
