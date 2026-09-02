@@ -4,7 +4,7 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "functions-framework --target=elead --port=8080"
+    "start": "functions-framework --target=helloHttp --port=8080"
   },
   "dependencies": {
     "@google-cloud/functions-framework": "^3.4.5",

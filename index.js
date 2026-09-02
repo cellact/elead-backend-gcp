@@ -3,11 +3,191 @@
 require('dotenv').config({ override: true });
 
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { ethers } = require('ethers');
 const functions = require('@google-cloud/functions-framework');
-const store = require('./lib/store');
-const { CHAIN_ID, getSdk, withLinkedSemaphore, statusKey } = require('./lib/sdk');
+const ArnaconSDK = require('arnacon-sdk');
 const { verifyProof } = require('@semaphore-protocol/proof');
+
+const CHAIN_ID = parseInt(process.env.CHAIN_ID || '11155111', 10);
+
+const DATA_DIR =
+  process.env.K_SERVICE || process.env.FUNCTION_TARGET
+    ? path.join(os.tmpdir(), 'elead-data')
+    : path.join(__dirname, 'data');
+const DOMAINS_FILE = path.join(DATA_DIR, 'domains.json');
+const LEADS_FILE = path.join(DATA_DIR, 'leads.json');
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function readJson(file, fallback) {
+  ensureDataDir();
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, JSON.stringify(fallback, null, 2));
+    return fallback;
+  }
+  return JSON.parse(fs.readFileSync(file, 'utf8'));
+}
+
+function writeJson(file, value) {
+  ensureDataDir();
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+function loadDomains() {
+  return readJson(DOMAINS_FILE, {});
+}
+
+function loadLeads() {
+  return readJson(LEADS_FILE, []);
+}
+
+function saveDomains(domains) {
+  writeJson(DOMAINS_FILE, domains);
+}
+
+function saveLeads(leads) {
+  writeJson(LEADS_FILE, leads);
+}
+
+function getDomain(domain) {
+  const domains = loadDomains();
+  return domains[domain] || null;
+}
+
+function linkDomain({ domain, spAddress, semaphoreInteractor, secondLevelInteractor }) {
+  const domains = loadDomains();
+  const existing = domains[domain] || {};
+  domains[domain] = {
+    ...existing,
+    domain,
+    spAddress: spAddress.toLowerCase(),
+    linkedAt: existing.linkedAt || new Date().toISOString(),
+  };
+  if (semaphoreInteractor) {
+    domains[domain].semaphoreInteractor = semaphoreInteractor;
+  }
+  if (secondLevelInteractor) {
+    domains[domain].secondLevelInteractor = secondLevelInteractor;
+  }
+  saveDomains(domains);
+  return domains[domain];
+}
+
+function findLead({ label, domain }) {
+  const leads = loadLeads();
+  const needle = String(label || '').toLowerCase();
+  if (domain) {
+    return leads.find((row) => row.label === needle && row.domain === domain) || null;
+  }
+  return leads.find((row) => row.label === needle) || null;
+}
+
+function addLead(lead) {
+  const leads = loadLeads();
+  leads.push(lead);
+  saveLeads(leads);
+  return lead;
+}
+
+function listDomains() {
+  return Object.values(loadDomains());
+}
+
+function leadsForDomain(domain) {
+  return loadLeads().filter((lead) => lead.domain === domain);
+}
+
+function leadsForSp(spAddress) {
+  const sp = String(spAddress || '').toLowerCase();
+  return loadLeads().filter((lead) => lead.spAddress === sp);
+}
+
+function updateLeadStatus(domain, label, status) {
+  const leads = loadLeads();
+  const lead = leads.find((row) => row.domain === domain && row.label === label);
+  if (!lead) return null;
+  lead.status = status;
+  lead.updatedAt = new Date().toISOString();
+  saveLeads(leads);
+  return lead;
+}
+
+const store = {
+  getDomain,
+  listDomains,
+  linkDomain,
+  addLead,
+  findLead,
+  leadsForDomain,
+  leadsForSp,
+  updateLeadStatus,
+};
+
+let cached;
+
+function normalizePrivateKey(raw) {
+  let key = String(raw || '').trim().split('#')[0].trim();
+  if (key.startsWith('0x') || key.startsWith('0X')) {
+    key = key.slice(2);
+  }
+  key = key.replace(/[^0-9a-fA-F]/g, '');
+  if (key.length !== 64) {
+    throw new Error('PRIVATE_KEY must be 32-byte hex. Restart the function after editing .env');
+  }
+  return `0x${key}`;
+}
+
+async function getSdk() {
+  if (cached) return cached;
+  const privateKey = normalizePrivateKey(process.env.PRIVATE_KEY);
+  const rpcUrl = (process.env.URL_RPC || '').trim();
+  const sdk = new ArnaconSDK({
+    privateKey,
+    chainId: CHAIN_ID,
+    ...(rpcUrl ? { rpcUrl } : {}),
+  });
+  cached = sdk;
+  return sdk;
+}
+
+function snapshotAddresses(sdk) {
+  return { ...sdk.getAllContractAddresses() };
+}
+
+async function withLinkedSemaphore(linked, fn) {
+  if (!linked || !linked.semaphoreInteractor) {
+    throw new Error(
+      'Domain has no SemaphoreInteractor. Re-run SP onboarding /ensureSemaphore.',
+    );
+  }
+  const sdk = await getSdk();
+  const prev = snapshotAddresses(sdk);
+  sdk.setContractAddresses({
+    ...prev,
+    SemaphoreInteractor: linked.semaphoreInteractor,
+    ...(linked.secondLevelInteractor
+      ? { SecondLevelInteractor: linked.secondLevelInteractor }
+      : {}),
+  });
+  try {
+    return await fn(sdk);
+  } finally {
+    sdk.setContractAddresses(prev);
+  }
+}
+
+function statusKey(label) {
+  return `lead:${label}:status`;
+}
 
 const DOMAIN_RE = /^[a-z0-9-]+$/;
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -437,7 +617,7 @@ async function dispatch(req, res) {
   return jsonError(res, 404, 'Not found');
 }
 
-functions.http('elead', async (req, res) => {
+functions.http('helloHttp', async (req, res) => {
   setCors(res);
   if (req.method === 'OPTIONS') {
     return res.status(204).send('');
