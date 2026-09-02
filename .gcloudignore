@@ -6,5 +6,4 @@ data
 .env
 .arnacon
 deploy.json
-cloudbuild.yaml
 *.md
