@@ -605,19 +605,23 @@ function eleadHtmlVersionBase() {
   return `${eleadProductHtmlUrl()}v2.0.0/`;
 }
 
+function eleadPagesRoot() {
+  return eleadProductHtmlUrl().replace(/\/+$/, '');
+}
+
 function eleadSpHtmlUrl() {
   const fromEnv = String(process.env.ELEAD_SP_HTML_URL || '').trim();
   if (fromEnv) {
     return fromEnv.replace(/\/+$/, '');
   }
-  return `${eleadProductHtmlUrl().replace(/\/+$/, '')}/sp-lead`;
+  return `${eleadPagesRoot()}/sp-elead`;
 }
 
 function buildProductClientUrl({ isSp } = {}) {
   if (isSp) {
     return eleadSpHtmlUrl();
   }
-  return eleadProductHtmlUrl().replace(/\/+$/, '');
+  return `${eleadPagesRoot()}/elead`;
 }
 
 function eleadProductInfo() {
