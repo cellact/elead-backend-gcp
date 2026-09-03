@@ -11,6 +11,8 @@
     "arnacon-sdk": "^1.0.41",
     "@semaphore-protocol/proof": "^4.14.2",
     "dotenv": "^17.2.0",
-    "ethers": "^5.8.0"
+    "ethers": "^5.8.0",
+    "@google-cloud/firestore": "^7.11.0",
+    "uuid": "^9.0.0"
   }
 }
