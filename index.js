@@ -645,6 +645,7 @@ async function notifyEleadActivated({
 }) {
   const info = eleadProductInfo();
   const clientUrl = buildProductClientUrl({ isSp });
+  const allotted = `${label}.${domain}.global`;
   const endpoint =
     String(process.env.URL_NOTIFICATION_CENTER || DEFAULT_NOTIFICATION_CENTER).trim() ||
     DEFAULT_NOTIFICATION_CENTER;
@@ -653,9 +654,9 @@ async function notifyEleadActivated({
     item: 'BATMAN',
     package_type: 'ELEAD',
     uuid_to_sign: crypto.randomUUID(),
-    callee: label,
+    callee: allotted,
     domain: 'paris1.cellact.nl',
-    label,
+    label: allotted,
     metadata: {
       serviceContract,
       name: info.name,
@@ -872,15 +873,11 @@ function normalizeDomain(value) {
 }
 
 function claimPageBase() {
-  const fromEnv = String(process.env.CLAIM_PAGE_URL || '').trim();
-  const raw = (fromEnv || `${eleadProductHtmlUrl()}v2.0.0/install.html`)
-    .replace(/\/$/, '')
-    .replace(/\?.*$/, '');
-  const origin = raw
-    .replace(/\/install\.html$/i, '')
-    .replace(/\/v2\.0\.0$/i, '')
-    .replace(/\/+$/, '');
-  return `${origin}/v2.0.0/install.html`;
+  const fromEnv = String(process.env.CLAIM_PAGE_URL || '').trim().replace(/\/$/, '').replace(/\?.*$/, '');
+  if (/\/(elead|sp-elead)\/v2\.0\.0\/install\.html$/i.test(fromEnv)) {
+    return fromEnv;
+  }
+  return `${eleadPagesRoot()}/elead/v2.0.0/install.html`;
 }
 
 function buildClaimUrl(userSecret, label, domain) {
