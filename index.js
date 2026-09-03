@@ -301,15 +301,20 @@ async function upsertInbox(domain, inbox) {
   return { ...record, ...patch, inboxes };
 }
 
+function claimedInboxes(record) {
+  const inboxes = record && Array.isArray(record.inboxes) ? record.inboxes : [];
+  return inboxes.filter(
+    (row) => String(row.status || '').toLowerCase() === 'claimed' && row.fullName,
+  );
+}
+
 async function pickToInbox(domain) {
   const record = await loadDomainRecord(domain);
   const inboxes = record && Array.isArray(record.inboxes) ? record.inboxes : [];
   if (inboxes.length === 0) {
     return null;
   }
-  const claimed = inboxes.filter(
-    (row) => String(row.status || '').toLowerCase() === 'claimed' && row.fullName,
-  );
+  const claimed = claimedInboxes(record);
   if (record.receiveMode === 'group') {
     if (claimed.length === 0) {
       return null;
@@ -321,6 +326,30 @@ async function pickToInbox(domain) {
     return selected.fullName;
   }
   return inboxes[0].fullName || null;
+}
+
+function studioDomainFrom(value) {
+  const raw = String(value || '')
+    .trim()
+    .toLowerCase();
+  if (!raw) {
+    return '';
+  }
+  const withoutGlobal = raw.replace(/\.global$/, '');
+  const parts = withoutGlobal.split('.').filter(Boolean);
+  if (parts.length === 0) {
+    return '';
+  }
+  return parts[parts.length - 1];
+}
+
+async function pickRandomClaimedInbox(domain) {
+  const record = await loadDomainRecord(domain);
+  const claimed = claimedInboxes(record);
+  if (claimed.length === 0) {
+    return null;
+  }
+  return claimed[crypto.randomInt(claimed.length)];
 }
 
 async function storedSemaphoreInteractor(domain, sliAddr, provider) {
@@ -576,13 +605,19 @@ function eleadHtmlVersionBase() {
   return `${eleadProductHtmlUrl()}v2.0.0/`;
 }
 
-function buildProductClientUrl({ isSp, toInbox }) {
-  const params = new URLSearchParams();
-  params.set('isSP', isSp ? 'true' : 'false');
-  if (toInbox) {
-    params.set('toInbox', String(toInbox));
+function eleadSpHtmlUrl() {
+  const fromEnv = String(process.env.ELEAD_SP_HTML_URL || '').trim();
+  if (fromEnv) {
+    return fromEnv.replace(/\/+$/, '');
   }
-  return `${eleadHtmlVersionBase()}?${params.toString()}`;
+  return `${eleadProductHtmlUrl().replace(/\/+$/, '')}/sp-lead`;
+}
+
+function buildProductClientUrl({ isSp } = {}) {
+  if (isSp) {
+    return eleadSpHtmlUrl();
+  }
+  return eleadProductHtmlUrl().replace(/\/+$/, '');
 }
 
 function eleadProductInfo() {
@@ -603,10 +638,9 @@ async function notifyEleadActivated({
   domain,
   serviceContract,
   isSp,
-  toInbox,
 }) {
   const info = eleadProductInfo();
-  const clientUrl = buildProductClientUrl({ isSp, toInbox });
+  const clientUrl = buildProductClientUrl({ isSp });
   const endpoint =
     String(process.env.URL_NOTIFICATION_CENTER || DEFAULT_NOTIFICATION_CENTER).trim() ||
     DEFAULT_NOTIFICATION_CENTER;
@@ -628,8 +662,6 @@ async function notifyEleadActivated({
       callProtocol: 'webrtc',
       messageProtocol: 'webrtc',
       domain: `${domain}.global`,
-      isSP: isSp,
-      toInbox: toInbox || undefined,
     },
   };
   console.log('[elead] activate notify request', {
@@ -1047,6 +1079,28 @@ async function handleGenerateInboxQR(req, res) {
     label: inboxName,
     domain,
     fullName,
+  });
+}
+
+async function handleGetInbox(req, res) {
+  const path = pathname(req);
+  const pathTail = path.split('/getInbox/')[1];
+  const fromDomain =
+    (req.query && (req.query.fromDomain || req.query.domain)) ||
+    (req.body && (req.body.fromDomain || req.body.domain)) ||
+    (pathTail ? decodeURIComponent(pathTail) : '');
+  const domain = studioDomainFrom(fromDomain);
+  if (!DOMAIN_RE.test(domain)) {
+    return jsonError(res, 400, 'fromDomain is required (2LD or {label}.{domain}.global)');
+  }
+  const picked = await pickRandomClaimedInbox(domain);
+  if (!picked) {
+    return jsonError(res, 404, `No claimed inbox for ${domain}`);
+  }
+  return res.json({
+    domain,
+    inbox: picked.fullName,
+    label: picked.label,
   });
 }
 
@@ -1503,14 +1557,7 @@ async function handleActivateWithProof(req, res) {
   }
   const fullName = `${label}.${domain}.global`;
   const isSp = kind === 'inbox';
-  let toInbox = null;
-  if (!isSp) {
-    toInbox = await pickToInbox(domain);
-    if (!toInbox) {
-      console.warn('[elead] activate notify has no toInbox for', domain);
-    }
-  }
-  const clientUrl = buildProductClientUrl({ isSp, toInbox });
+  const clientUrl = buildProductClientUrl({ isSp });
   let notify;
   try {
     notify = await notifyEleadActivated({
@@ -1519,7 +1566,6 @@ async function handleActivateWithProof(req, res) {
       domain,
       serviceContract: resolved.secondLevelInteractor,
       isSp,
-      toInbox,
     });
   } catch (err) {
     console.warn('[elead] activate notify failed (non-fatal)', err.message);
@@ -1597,6 +1643,12 @@ async function dispatch(req, res) {
   }
   if (req.method === 'POST' && (action === 'generateInboxQR' || path.endsWith('/generateInboxQR'))) {
     return handleGenerateInboxQR(req, res);
+  }
+  if (
+    req.method === 'GET' &&
+    (path === '/getInbox' || path.endsWith('/getInbox') || /\/getInbox\//.test(path))
+  ) {
+    return handleGetInbox(req, res);
   }
   if (req.method === 'GET' && path.endsWith('/inboxes')) {
     return handleListInboxes(req, res);
