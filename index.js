@@ -1359,19 +1359,31 @@ async function handleListInboxFeeds(req, res) {
 
 async function handleConfig(_req, res) {
   const sdk = await getSdk();
-  const artifactNames = ['SecondLevelInteractor', 'ArnaconResolver'];
+  const artifactNames = [
+    'SecondLevelInteractor',
+    'ArnaconResolver',
+    'PoseidonT3',
+    'SemaphoreInteractor',
+  ];
   const artifacts = {};
   for (const name of artifactNames) {
     const artifact = sdk.factoryLoader.getArtifact(name);
     if (!artifact || !artifact.bytecode) {
       throw new Error(`missing bytecode for ${name}`);
     }
-    artifacts[name] = { bytecode: artifact.bytecode };
+    artifacts[name] = {
+      bytecode: artifact.bytecode,
+      linkReferences: artifact.linkReferences || {},
+    };
+  }
+  const contracts = { ...sdk.getAllContractAddresses() };
+  if (CHAIN_ID === 11155111) {
+    contracts.SemaphoreVerifier = SEPOLIA_VERIFIER;
   }
   return res.json({
     backendAddress: sdk.getSignerAddress(),
     chainId: CHAIN_ID,
-    contracts: sdk.getAllContractAddresses(),
+    contracts,
     artifacts,
   });
 }
