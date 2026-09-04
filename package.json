@@ -13,6 +13,7 @@
     "dotenv": "^17.2.0",
     "ethers": "^5.8.0",
     "@google-cloud/firestore": "^7.11.0",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "@ethersphere/bee-js": "^13.0.0"
   }
 }

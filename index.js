@@ -284,48 +284,15 @@ function inboxFullName(domain, label) {
 }
 
 async function upsertInbox(domain, inbox) {
-  const record = (await loadDomainRecord(domain)) || {};
-  const inboxes = Array.isArray(record.inboxes) ? record.inboxes.slice() : [];
-  const idx = inboxes.findIndex((row) => row.label === inbox.label);
-  if (idx >= 0) {
-    inboxes[idx] = { ...inboxes[idx], ...inbox };
-  } else {
-    inboxes.push(inbox);
-  }
-  const patch = { inboxes };
-  if (!record.receiveInbox) {
-    patch.receiveMode = record.receiveMode || 'single';
-    patch.receiveInbox = inbox.label;
-  }
-  await saveDomainRecord(domain, patch);
-  return { ...record, ...patch, inboxes };
-}
-
-function claimedInboxes(record) {
-  const inboxes = record && Array.isArray(record.inboxes) ? record.inboxes : [];
-  return inboxes.filter(
-    (row) => String(row.status || '').toLowerCase() === 'claimed' && row.fullName,
-  );
-}
-
-async function pickToInbox(domain) {
-  const record = await loadDomainRecord(domain);
-  const inboxes = record && Array.isArray(record.inboxes) ? record.inboxes : [];
-  if (inboxes.length === 0) {
-    return null;
-  }
-  const claimed = claimedInboxes(record);
-  if (record.receiveMode === 'group') {
-    if (claimed.length === 0) {
-      return null;
-    }
-    return claimed[crypto.randomInt(claimed.length)].fullName;
-  }
-  const selected = inboxes.find((row) => row.label === record.receiveInbox);
-  if (selected && selected.fullName) {
-    return selected.fullName;
-  }
-  return inboxes[0].fullName || null;
+  await saveDomainRecord(domain, {
+    inboxMirror: {
+      label: inbox.label,
+      fullName: inbox.fullName,
+      status: inbox.status || null,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+  return inbox;
 }
 
 function studioDomainFrom(value) {
@@ -343,31 +310,106 @@ function studioDomainFrom(value) {
   return parts[parts.length - 1];
 }
 
-async function pickRandomClaimedInbox(domain) {
-  const record = await loadDomainRecord(domain);
-  const claimed = claimedInboxes(record);
-  if (claimed.length === 0) {
-    return null;
+const SI_TEXT_KEY = 'semaphoreInteractor';
+const INBOX_LIST_KEY = 'inboxList';
+const PUBLIC_RESOLVER_TEXT_ABI = [
+  'function text(bytes32 node, string key) view returns (string)',
+];
+const SLI_SET_TEXT_ABI = [
+  'function setText(string name, string key, string value)',
+];
+
+async function publicResolverText(sdk, domain, key) {
+  const resolverAddr = sdk.getAllContractAddresses().PublicResolver;
+  if (!resolverAddr || resolverAddr.toLowerCase() === ZERO) {
+    return '';
   }
-  return claimed[crypto.randomInt(claimed.length)];
+  const resolver = new ethers.Contract(
+    resolverAddr,
+    PUBLIC_RESOLVER_TEXT_ABI,
+    sdk.getProvider(),
+  );
+  const raw = await resolver.text(ethers.utils.namehash(`${domain}.global`), key);
+  return String(raw || '').trim();
 }
 
-async function storedSemaphoreInteractor(domain, sliAddr, provider) {
-  const record = await loadDomainRecord(domain);
-  const siAddr = record && record.semaphoreInteractor;
-  if (!siAddr || !ethers.utils.isAddress(siAddr) || siAddr.toLowerCase() === ZERO) {
+async function semaphoreInteractorFromEns(sdk, domain) {
+  const value = await publicResolverText(sdk, domain, SI_TEXT_KEY);
+  if (!value || !ethers.utils.isAddress(value) || value.toLowerCase() === ZERO) {
     return null;
   }
-  const si = new ethers.Contract(siAddr, SI_VIEW_ABI, provider);
-  try {
-    const bound = await si.interactor();
-    if (String(bound).toLowerCase() === sliAddr.toLowerCase()) {
-      return ethers.utils.getAddress(siAddr);
-    }
-  } catch (_err) {
-    /* stale doc */
+  return ethers.utils.getAddress(value);
+}
+
+function parseInboxList(raw) {
+  if (!raw) {
+    return [];
   }
-  return null;
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_err) {
+    return [];
+  }
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  const out = [];
+  const seen = new Set();
+  for (const row of data) {
+    let label = '';
+    let fullName = '';
+    if (typeof row === 'string') {
+      fullName = row.trim().toLowerCase();
+      if (!fullName.endsWith('.global')) {
+        continue;
+      }
+      const withoutGlobal = fullName.replace(/\.global$/, '');
+      const parts = withoutGlobal.split('.').filter(Boolean);
+      if (parts.length < 1) {
+        continue;
+      }
+      label = parts[0];
+    } else if (row && typeof row === 'object') {
+      label = String(row.label || '')
+        .trim()
+        .toLowerCase();
+      fullName = String(row.fullName || '')
+        .trim()
+        .toLowerCase();
+      if (!fullName && label) {
+        fullName = `${label}.${String(row.domain || '').trim().toLowerCase()}.global`;
+      }
+    }
+    if (!label || !fullName || seen.has(label)) {
+      continue;
+    }
+    seen.add(label);
+    out.push({ label, fullName });
+  }
+  return out;
+}
+
+async function readInboxListFromEns(sdk, domain) {
+  try {
+    return parseInboxList(await publicResolverText(sdk, domain, INBOX_LIST_KEY));
+  } catch (err) {
+    console.warn('[elead] inboxList text read failed', err.message);
+    return [];
+  }
+}
+
+async function appendClaimedInboxToEns(sdk, sliAddr, domain, label, fullName) {
+  const current = await readInboxListFromEns(sdk, domain);
+  const next = current.filter((row) => row.label !== label);
+  next.push({
+    label,
+    fullName: String(fullName).toLowerCase(),
+  });
+  const sli = new ethers.Contract(sliAddr, SLI_SET_TEXT_ABI, sdk.signer);
+  const tx = await sli.setText(domain, INBOX_LIST_KEY, JSON.stringify(next));
+  await tx.wait();
+  return next;
 }
 
 let cached;
@@ -442,9 +484,6 @@ function statusKey(label) {
   return `lead:${label}:status`;
 }
 
-const ROLE_GRANTED_ABI = [
-  'event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)',
-];
 const SI_VIEW_ABI = [
   'function interactor() view returns (address)',
   'function REGISTER_SCOPE() view returns (uint256)',
@@ -471,60 +510,27 @@ const REGISTRY_ABI = ['function owner(bytes32 node) view returns (address)'];
 const WRAPPER_ABI = ['function ownerOf(uint256 id) view returns (address)'];
 
 async function findSemaphoreInteractor(sdk, sliAddr, domain) {
-  const provider = sdk.getProvider();
-  if (domain) {
-    const stored = await storedSemaphoreInteractor(domain, sliAddr, provider);
-    if (stored) {
-      return stored;
-    }
-  }
-  const addresses = sdk.getAllContractAddresses();
-  const defaultSi = addresses.SemaphoreInteractor;
-  if (defaultSi && defaultSi !== ZERO) {
-    const si = new ethers.Contract(defaultSi, SI_VIEW_ABI, provider);
-    try {
-      const bound = await si.interactor();
-      if (String(bound).toLowerCase() === sliAddr.toLowerCase()) {
-        if (domain) {
-          await saveDomainRecord(domain, {
-            secondLevelInteractor: sliAddr,
-            semaphoreInteractor: defaultSi,
-          });
-        }
-        return defaultSi;
-      }
-    } catch (_err) {
-      /* not an SI or wrong ABI */
-    }
-  }
-
-  const sli = new ethers.Contract(sliAddr, ROLE_GRANTED_ABI, provider);
-  const role = ethers.utils.id('CONTROLLER_ROLE');
-  const fromBlock = parseInt(addresses.SemaphoreInteractor_DeployBlock || '0', 10) || 0;
-  let logs = [];
-  try {
-    logs = await sli.queryFilter(sli.filters.RoleGranted(role), fromBlock, 'latest');
-  } catch (_err) {
+  if (!domain) {
     return null;
   }
-  for (let i = logs.length - 1; i >= 0; i -= 1) {
-    const account = logs[i].args.account;
-    const candidate = new ethers.Contract(account, SI_VIEW_ABI, provider);
-    try {
-      await candidate.REGISTER_SCOPE();
-      const bound = await candidate.interactor();
-      if (String(bound).toLowerCase() === sliAddr.toLowerCase()) {
-        if (domain) {
-          await saveDomainRecord(domain, {
-            secondLevelInteractor: sliAddr,
-            semaphoreInteractor: account,
-          });
-        }
-        return account;
-      }
-    } catch (_err) {
-      /* not SI */
+  let fromEns;
+  try {
+    fromEns = await semaphoreInteractorFromEns(sdk, domain);
+  } catch (err) {
+    console.warn('[elead] PublicResolver text semaphoreInteractor failed', err.message);
+    return null;
+  }
+  if (!fromEns) {
+    return null;
+  }
+  const si = new ethers.Contract(fromEns, SI_VIEW_ABI, sdk.getProvider());
+  try {
+    const bound = await si.interactor();
+    if (String(bound).toLowerCase() === sliAddr.toLowerCase()) {
+      return fromEns;
     }
+  } catch (err) {
+    console.warn('[elead] ENS semaphoreInteractor is not an SI', fromEns, err.message);
   }
   return null;
 }
@@ -872,15 +878,23 @@ function normalizeDomain(value) {
     .replace(/\.global$/, '');
 }
 
-function claimPageBase() {
-  const fromEnv = String(process.env.CLAIM_PAGE_URL || '').trim().replace(/\/$/, '').replace(/\?.*$/, '');
-  if (/\/(elead|sp-elead)\/v2\.0\.0\/install\.html$/i.test(fromEnv)) {
+function claimPageBase({ isSp } = {}) {
+  const product = isSp ? 'sp-elead' : 'elead';
+  const fromEnv = String(
+    isSp
+      ? process.env.CLAIM_PAGE_URL_SP || process.env.CLAIM_PAGE_URL || ''
+      : process.env.CLAIM_PAGE_URL || '',
+  )
+    .trim()
+    .replace(/\/$/, '')
+    .replace(/\?.*$/, '');
+  if (new RegExp(`/${product}/v2\\.0\\.0/install\\.html$`, 'i').test(fromEnv)) {
     return fromEnv;
   }
-  return `${eleadPagesRoot()}/elead/v2.0.0/install.html`;
+  return `${eleadPagesRoot()}/${product}/v2.0.0/install.html`;
 }
 
-function buildClaimUrl(userSecret, label, domain) {
+function buildClaimUrl(userSecret, label, domain, { isSp } = {}) {
   const params = new URLSearchParams({
     secret: String(userSecret),
     label: String(label),
@@ -892,7 +906,7 @@ function buildClaimUrl(userSecret, label, domain) {
   if (process.env.CLAIM_DEV === 'false') {
     params.set('dev', 'false');
   }
-  const claimPage = `${claimPageBase()}?${params.toString()}`;
+  const claimPage = `${claimPageBase({ isSp })}?${params.toString()}`;
   const provider = process.env.CLAIM_PROVIDER || 'Elead';
   return `arnacon://install?url=${encodeURIComponent(claimPage)}&provider=${encodeURIComponent(provider)}`;
 }
@@ -915,6 +929,407 @@ function jsonError(res, status, message) {
     }
   }
   return res.status(status).json({ error: text });
+}
+
+const INBOX_FEED_SCHEMA = 'elead.inbox.feed.v1';
+const LEAD_STATUS_KEYS = ['pending', 'in_progress', 'done', 'expired'];
+
+function swarmBeeUrl() {
+  return String(process.env.SWARM_BEE_URL || '').trim();
+}
+
+function swarmPostageBatchId() {
+  return String(process.env.SWARM_POSTAGE_BATCH_ID || '')
+    .trim()
+    .replace(/^0x/i, '');
+}
+
+function swarmFeedPrivateKeyHex() {
+  const raw = String(
+    process.env.SWARM_FEED_PRIVATE_KEY || process.env.PRIVATE_KEY || '',
+  ).trim();
+  const hex = raw.replace(/^0x/i, '');
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error('SWARM_FEED_PRIVATE_KEY or PRIVATE_KEY must be a 32-byte hex key');
+  }
+  return hex;
+}
+
+function emptyLeadCounts() {
+  return { pending: 0, in_progress: 0, done: 0, expired: 0 };
+}
+
+function recomputeLeadCounts(cases) {
+  const counts = emptyLeadCounts();
+  for (const row of Object.values(cases || {})) {
+    const status = String((row && row.status) || '').trim();
+    if (Object.prototype.hasOwnProperty.call(counts, status)) {
+      counts[status] += 1;
+    }
+  }
+  return counts;
+}
+
+function inboxFeedTopicText(domain, inboxLabel) {
+  return `elead:${inboxLabel}.${domain}.global`;
+}
+
+function inboxLabelFromInput(value, domain) {
+  let raw = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.global$/, '');
+  const d = String(domain || '')
+    .trim()
+    .toLowerCase();
+  if (d && (raw === d || raw.endsWith(`.${d}`))) {
+    raw = raw.slice(0, raw.length - d.length).replace(/\.$/, '');
+  }
+  const label = raw.split('.').filter(Boolean)[0] || '';
+  return label;
+}
+
+function inboxFeedMessage(domain, inboxLabel, timestamp) {
+  return `elead-inbox-feed\n${domain}\n${inboxLabel}\n${timestamp}`;
+}
+
+function toUtf8Maybe(value) {
+  if (value && typeof value.toUtf8 === 'function') {
+    return value.toUtf8();
+  }
+  if (value && value.payload && typeof value.payload.toUtf8 === 'function') {
+    return value.payload.toUtf8();
+  }
+  return '';
+}
+
+function emptyInboxFeed(domain, inboxLabel) {
+  const now = new Date().toISOString();
+  return {
+    schema: INBOX_FEED_SCHEMA,
+    domain,
+    inbox: inboxFullName(domain, inboxLabel),
+    updatedAt: now,
+    counts: emptyLeadCounts(),
+    cases: {},
+  };
+}
+
+function normalizeInboxFeed(raw, domain, inboxLabel) {
+  const base = emptyInboxFeed(domain, inboxLabel);
+  if (!raw || typeof raw !== 'object') {
+    return base;
+  }
+  const cases = {};
+  const src = raw.cases && typeof raw.cases === 'object' ? raw.cases : {};
+  for (const [lead, row] of Object.entries(src)) {
+    const label = String(lead || '')
+      .trim()
+      .toLowerCase();
+    if (!label) {
+      continue;
+    }
+    cases[label] = {
+      status: String((row && row.status) || '').trim() || 'pending',
+      updatedAt: String((row && row.updatedAt) || base.updatedAt),
+    };
+  }
+  const countsIn = raw.counts && typeof raw.counts === 'object' ? raw.counts : {};
+  const counts = emptyLeadCounts();
+  for (const key of LEAD_STATUS_KEYS) {
+    const n = Number(countsIn[key]);
+    counts[key] = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+  }
+  return {
+    schema: INBOX_FEED_SCHEMA,
+    domain,
+    inbox: inboxFullName(domain, inboxLabel),
+    updatedAt: String(raw.updatedAt || base.updatedAt),
+    counts,
+    cases,
+  };
+}
+
+let beeJsModule;
+
+async function loadBeeJs() {
+  if (!beeJsModule) {
+    beeJsModule = await import('@ethersphere/bee-js');
+  }
+  return beeJsModule;
+}
+
+async function requireSwarmWriteConfig() {
+  const beeUrl = swarmBeeUrl();
+  const batchId = swarmPostageBatchId();
+  if (!beeUrl) {
+    throw new Error('SWARM_BEE_URL is not set');
+  }
+  if (!batchId || batchId.includes('REPLACE')) {
+    throw new Error('SWARM_POSTAGE_BATCH_ID is not set');
+  }
+  return { beeUrl, batchId, privateKeyHex: swarmFeedPrivateKeyHex() };
+}
+
+async function requireSwarmReadConfig() {
+  const beeUrl = swarmBeeUrl();
+  if (!beeUrl) {
+    throw new Error('SWARM_BEE_URL is not set');
+  }
+  return { beeUrl, privateKeyHex: swarmFeedPrivateKeyHex() };
+}
+
+async function inboxFeedReader(domain, inboxLabel) {
+  const { Bee, Topic, PrivateKey } = await loadBeeJs();
+  const { beeUrl, privateKeyHex } = await requireSwarmReadConfig();
+  const privateKey = new PrivateKey(privateKeyHex);
+  const bee = new Bee(beeUrl);
+  const topic = Topic.fromString(inboxFeedTopicText(domain, inboxLabel));
+  const reader = bee.feed.makeReader(topic, privateKey.publicKey().address());
+  return { bee, topic, privateKey, reader };
+}
+
+async function downloadInboxFeed(domain, inboxLabel) {
+  const { reader } = await inboxFeedReader(domain, inboxLabel);
+  try {
+    const latest = await reader.downloadPayload();
+    const text = toUtf8Maybe(latest);
+    const parsed = text ? JSON.parse(text) : null;
+    return normalizeInboxFeed(parsed, domain, inboxLabel);
+  } catch (_err) {
+    return emptyInboxFeed(domain, inboxLabel);
+  }
+}
+
+async function uploadInboxFeed(domain, inboxLabel, payload) {
+  const { Bee, Topic, PrivateKey } = await loadBeeJs();
+  const { beeUrl, batchId, privateKeyHex } = await requireSwarmWriteConfig();
+  const privateKey = new PrivateKey(privateKeyHex);
+  const bee = new Bee(beeUrl);
+  const topic = Topic.fromString(inboxFeedTopicText(domain, inboxLabel));
+  const writer = bee.feed.makeWriter(topic, privateKey);
+  const body = normalizeInboxFeed(payload, domain, inboxLabel);
+  body.updatedAt = new Date().toISOString();
+  await writer.uploadPayload(batchId, JSON.stringify(body));
+  return body;
+}
+
+async function ensNameOwner(fullName) {
+  const sdk = await getSdk();
+  const provider = sdk.getProvider();
+  const addresses = sdk.getAllContractAddresses();
+  const node = ethers.utils.namehash(fullName);
+  const registry = new ethers.Contract(addresses.ENSRegistry, REGISTRY_ABI, provider);
+  let owner = await registry.owner(node);
+  if (!owner || owner.toLowerCase() === ZERO) {
+    throw new Error(`${fullName} has no ENS owner`);
+  }
+  if (
+    addresses.NameWrapper &&
+    owner.toLowerCase() === addresses.NameWrapper.toLowerCase()
+  ) {
+    const wrapper = new ethers.Contract(addresses.NameWrapper, WRAPPER_ABI, provider);
+    owner = await wrapper.ownerOf(ethers.BigNumber.from(node));
+  }
+  if (!owner || owner.toLowerCase() === ZERO) {
+    throw new Error(`${fullName} has no wrapped owner`);
+  }
+  return owner.toLowerCase();
+}
+
+async function requireInboxOnList(domain, inboxLabel) {
+  const sdk = await getSdk();
+  const list = await readInboxListFromEns(sdk, domain);
+  const hit = list.find((row) => row.label === inboxLabel);
+  if (!hit) {
+    throw new Error(`${inboxFullName(domain, inboxLabel)} is not on inboxList`);
+  }
+  return hit;
+}
+
+async function requireInboxFeedSignature({ domain, inboxLabel, timestamp, signature }) {
+  const ts = requireTimestamp(timestamp);
+  await requireInboxOnList(domain, inboxLabel);
+  const message = inboxFeedMessage(domain, inboxLabel, ts);
+  let recovered;
+  try {
+    recovered = ethers.utils.verifyMessage(message, signature);
+  } catch (_err) {
+    throw new Error('Invalid signature');
+  }
+  const recoveredLc = recovered.toLowerCase();
+  const fullName = inboxFullName(domain, inboxLabel);
+  const owner = await ensNameOwner(fullName);
+  if (recoveredLc !== owner) {
+    throw new Error(`Signer ${recoveredLc} is not ENS owner ${owner} of ${fullName}`);
+  }
+  return { owner: recoveredLc, timestamp: ts, fullName };
+}
+
+function parseInboxFeedQuery(req) {
+  const src = Object.assign({}, req.query || {}, req.body || {});
+  const domain = normalizeDomain(src.domain);
+  const inboxLabel = inboxLabelFromInput(src.inbox || src.inboxName || src.label, domain);
+  const lead = String(src.lead || src.leadLabel || '')
+    .trim()
+    .toLowerCase();
+  return { domain, inboxLabel, lead, src };
+}
+
+async function handleGetInboxFeedLead(req, res) {
+  const { domain, inboxLabel, lead } = parseInboxFeedQuery(req);
+  if (!DOMAIN_RE.test(domain) || !DOMAIN_RE.test(inboxLabel) || !lead) {
+    return jsonError(res, 400, 'domain, inbox, and lead are required');
+  }
+  try {
+    await requireInboxOnList(domain, inboxLabel);
+    const feed = await downloadInboxFeed(domain, inboxLabel);
+    const row = feed.cases[lead] || null;
+    return res.json({
+      domain,
+      inbox: inboxLabel,
+      fullName: inboxFullName(domain, inboxLabel),
+      lead,
+      status: row ? row.status : null,
+      updatedAt: row ? row.updatedAt : null,
+      found: Boolean(row),
+    });
+  } catch (err) {
+    return jsonError(res, 400, err.message || err);
+  }
+}
+
+async function handlePostInboxFeedLead(req, res) {
+  const { domain, inboxLabel, lead, src } = parseInboxFeedQuery(req);
+  const status = String(src.status || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, '_');
+  if (!DOMAIN_RE.test(domain) || !DOMAIN_RE.test(inboxLabel) || !lead) {
+    return jsonError(res, 400, 'domain, inbox, and lead are required');
+  }
+  if (!LEAD_STATUS_KEYS.includes(status)) {
+    return jsonError(res, 400, `status must be one of ${LEAD_STATUS_KEYS.join(', ')}`);
+  }
+  try {
+    await requireInboxFeedSignature({
+      domain,
+      inboxLabel,
+      timestamp: src.timestamp,
+      signature: src.signature,
+    });
+    const feed = await downloadInboxFeed(domain, inboxLabel);
+    const now = new Date().toISOString();
+    feed.cases[lead] = { status, updatedAt: now };
+    feed.counts = recomputeLeadCounts(feed.cases);
+    const saved = await uploadInboxFeed(domain, inboxLabel, feed);
+    return res.json({
+      domain,
+      inbox: inboxLabel,
+      fullName: saved.inbox,
+      lead,
+      status,
+      updatedAt: saved.cases[lead].updatedAt,
+      counts: saved.counts,
+    });
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    const code = /signer|signature|owner|timestamp|expired/i.test(msg) ? 401 : 400;
+    return jsonError(res, code, msg);
+  }
+}
+
+async function handleGetInboxFeedSummary(req, res) {
+  const { domain, inboxLabel } = parseInboxFeedQuery(req);
+  if (!DOMAIN_RE.test(domain) || !DOMAIN_RE.test(inboxLabel)) {
+    return jsonError(res, 400, 'domain and inbox are required');
+  }
+  try {
+    await requireInboxOnList(domain, inboxLabel);
+    const feed = await downloadInboxFeed(domain, inboxLabel);
+    return res.json({
+      domain,
+      inbox: inboxLabel,
+      fullName: feed.inbox,
+      updatedAt: feed.updatedAt,
+      counts: feed.counts,
+    });
+  } catch (err) {
+    return jsonError(res, 400, err.message || err);
+  }
+}
+
+async function handlePostInboxFeedSummary(req, res) {
+  const { domain, inboxLabel, src } = parseInboxFeedQuery(req);
+  if (!DOMAIN_RE.test(domain) || !DOMAIN_RE.test(inboxLabel)) {
+    return jsonError(res, 400, 'domain and inbox are required');
+  }
+  const countsIn = src.counts && typeof src.counts === 'object' ? src.counts : src;
+  const counts = emptyLeadCounts();
+  for (const key of LEAD_STATUS_KEYS) {
+    const n = Number(countsIn[key]);
+    if (!Number.isFinite(n) || n < 0) {
+      return jsonError(res, 400, `counts.${key} must be a non-negative integer`);
+    }
+    counts[key] = Math.floor(n);
+  }
+  try {
+    await requireInboxFeedSignature({
+      domain,
+      inboxLabel,
+      timestamp: src.timestamp,
+      signature: src.signature,
+    });
+    const feed = await downloadInboxFeed(domain, inboxLabel);
+    feed.counts = counts;
+    const saved = await uploadInboxFeed(domain, inboxLabel, feed);
+    return res.json({
+      domain,
+      inbox: inboxLabel,
+      fullName: saved.inbox,
+      updatedAt: saved.updatedAt,
+      counts: saved.counts,
+    });
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    const code = /signer|signature|owner|timestamp|expired/i.test(msg) ? 401 : 400;
+    return jsonError(res, code, msg);
+  }
+}
+
+async function handleListInboxFeeds(req, res) {
+  const domain = normalizeDomain((req.query && req.query.domain) || (req.body && req.body.domain));
+  if (!DOMAIN_RE.test(domain)) {
+    return jsonError(res, 400, 'Invalid domain');
+  }
+  try {
+    const sdk = await getSdk();
+    const list = await readInboxListFromEns(sdk, domain);
+    const inboxes = [];
+    for (const row of list) {
+      try {
+        const feed = await downloadInboxFeed(domain, row.label);
+        inboxes.push({
+          label: row.label,
+          fullName: row.fullName,
+          updatedAt: feed.updatedAt,
+          counts: feed.counts,
+          cases: feed.cases,
+        });
+      } catch (err) {
+        inboxes.push({
+          label: row.label,
+          fullName: row.fullName,
+          error: err.message || String(err),
+          counts: emptyLeadCounts(),
+          cases: {},
+        });
+      }
+    }
+    return res.json({ domain, inboxes });
+  } catch (err) {
+    return jsonError(res, 400, err.message || err);
+  }
 }
 
 async function handleConfig(_req, res) {
@@ -995,7 +1410,7 @@ async function handleGenerateLeadQR(req, res) {
     createdAt: new Date().toISOString(),
   });
 
-  const url = buildClaimUrl(userSecret, label, domain);
+  const url = buildClaimUrl(userSecret, label, domain, { isSp: false });
 
   return res.json({
     url,
@@ -1027,10 +1442,9 @@ async function handleGenerateInboxQR(req, res) {
     return jsonError(res, 401, err && err.message ? err.message : err);
   }
 
-  const record = await loadDomainRecord(domain);
-  const existing = record && Array.isArray(record.inboxes)
-    ? record.inboxes.find((row) => row.label === inboxName)
-    : null;
+  const sdk = await getSdk();
+  const existingInboxes = await readInboxListFromEns(sdk, domain);
+  const existing = existingInboxes.find((row) => row.label === inboxName);
   if (existing) {
     return jsonError(res, 400, `Inbox ${inboxFullName(domain, inboxName)} already exists`);
   }
@@ -1074,7 +1488,7 @@ async function handleGenerateInboxQR(req, res) {
     console.error('[elead] firestore save inbox failed', err.message);
   }
 
-  const url = buildClaimUrl(inserted.userSecret, inboxName, domain);
+  const url = buildClaimUrl(inserted.userSecret, inboxName, domain, { isSp: true });
   return res.json({
     url,
     label: inboxName,
@@ -1094,9 +1508,11 @@ async function handleGetInbox(req, res) {
   if (!DOMAIN_RE.test(domain)) {
     return jsonError(res, 400, 'fromDomain is required (2LD or {label}.{domain}.global)');
   }
-  const picked = await pickRandomClaimedInbox(domain);
+  const sdk = await getSdk();
+  const fromEns = await readInboxListFromEns(sdk, domain);
+  const picked = fromEns.length > 0 ? fromEns[crypto.randomInt(fromEns.length)] : null;
   if (!picked) {
-    return jsonError(res, 404, `No claimed inbox for ${domain}`);
+    return jsonError(res, 404, `No inboxList entries for ${domain}`);
   }
   return res.json({
     domain,
@@ -1110,12 +1526,14 @@ async function handleListInboxes(req, res) {
   if (!DOMAIN_RE.test(domain)) {
     return jsonError(res, 400, 'Invalid domain');
   }
-  const record = (await loadDomainRecord(domain)) || {};
+  const sdk = await getSdk();
+  const ensInboxes = await readInboxListFromEns(sdk, domain);
   return res.json({
     domain,
-    receiveMode: record.receiveMode || 'single',
-    receiveInbox: record.receiveInbox || null,
-    inboxes: Array.isArray(record.inboxes) ? record.inboxes : [],
+    receiveMode: null,
+    receiveInbox: null,
+    inboxes: ensInboxes,
+    inboxList: ensInboxes,
   });
 }
 
@@ -1144,15 +1562,15 @@ async function handleSetInboxRouting(req, res) {
   } catch (err) {
     return jsonError(res, 401, err && err.message ? err.message : err);
   }
-  const record = (await loadDomainRecord(domain)) || {};
-  const inboxes = Array.isArray(record.inboxes) ? record.inboxes : [];
+  const sdk = await getSdk();
+  const inboxes = await readInboxListFromEns(sdk, domain);
   if (mode === 'single' && !inboxes.some((row) => row.label === inboxName)) {
     return jsonError(res, 400, `Unknown inbox ${inboxName}`);
   }
   try {
     await saveDomainRecord(domain, {
       receiveMode: mode,
-      receiveInbox: mode === 'single' ? inboxName : record.receiveInbox || null,
+      receiveInbox: mode === 'single' ? inboxName : null,
     });
   } catch (err) {
     return jsonError(res, 503, `Could not persist routing: ${err.message}`);
@@ -1160,7 +1578,7 @@ async function handleSetInboxRouting(req, res) {
   return res.json({
     domain,
     receiveMode: mode,
-    receiveInbox: mode === 'single' ? inboxName : record.receiveInbox || null,
+    receiveInbox: mode === 'single' ? inboxName : null,
     inboxes,
   });
 }
@@ -1238,6 +1656,33 @@ async function handleFetchLeads(req, res) {
   return res.json({ domain: domain || null, sp: sp || null, leads });
 }
 
+async function deploySemaphoreInteractorWithoutGrant(sdk, secondLevelInteractor) {
+  const poseidonT3 = await sdk.deploymentManager.deployIfNeeded('PoseidonT3');
+  const semaphoreVerifier = await sdk.deploymentManager.deployIfNeeded('SemaphoreVerifier');
+  const semaphoreInteractor = await sdk.deploymentManager.deployIfNeeded(
+    'SemaphoreInteractor',
+    semaphoreVerifier.address,
+    secondLevelInteractor,
+    { _libraries: { PoseidonT3: poseidonT3.address } },
+  );
+  return {
+    poseidonT3: poseidonT3.address,
+    semaphoreVerifier: semaphoreVerifier.address,
+    semaphoreInteractor: semaphoreInteractor.address,
+    interactor: secondLevelInteractor,
+  };
+}
+
+async function sliHasControllerRole(sliAddr, account, provider) {
+  const sli = new ethers.Contract(
+    sliAddr,
+    ['function hasRole(bytes32 role, address account) view returns (bool)'],
+    provider,
+  );
+  const role = ethers.utils.keccak256(ethers.utils.toUtf8Bytes('CONTROLLER_ROLE'));
+  return sli.hasRole(role, account);
+}
+
 async function handleEnsureSemaphore(req, res) {
   const body = req.body || {};
   const domain = normalizeDomain(body.domain);
@@ -1264,14 +1709,6 @@ async function handleEnsureSemaphore(req, res) {
     return jsonError(res, 400, 'Invalid secondLevelInteractor');
   }
   if (resolved.semaphoreInteractor) {
-    try {
-      await saveDomainRecord(domain, {
-        secondLevelInteractor,
-        semaphoreInteractor: resolved.semaphoreInteractor,
-      });
-    } catch (err) {
-      console.warn('[elead] firestore save SI failed', err.message);
-    }
     return res.json({
       domain,
       secondLevelInteractor,
@@ -1291,30 +1728,22 @@ async function handleEnsureSemaphore(req, res) {
   delete contracts.SemaphoreInteractor;
   delete contracts.SemaphoreInteractor_DeployBlock;
 
-  const deployed = await sdk.deploySemaphoreInteractor(secondLevelInteractor);
+  const deployed = await deploySemaphoreInteractorWithoutGrant(sdk, secondLevelInteractor);
+  let needsGrant = true;
   try {
-    await saveDomainRecord(domain, {
+    needsGrant = !(await sliHasControllerRole(
       secondLevelInteractor,
-      semaphoreInteractor: deployed.semaphoreInteractor,
-    });
-  } catch (err) {
-    console.error(
-      '[elead] firestore save SI failed after deploy',
       deployed.semaphoreInteractor,
-      err.message,
-    );
+      sdk.getProvider(),
+    ));
+  } catch (err) {
+    console.warn('[elead] hasRole CONTROLLER_ROLE check failed', err.message);
   }
-  store.linkDomain({
-    domain,
-    spAddress: resolved.secondLevelController,
-    secondLevelInteractor,
-    semaphoreInteractor: deployed.semaphoreInteractor,
-  });
   return res.json({
     domain,
     secondLevelInteractor,
     semaphoreInteractor: deployed.semaphoreInteractor,
-    needsGrant: true,
+    needsGrant,
   });
 }
 
@@ -1539,17 +1968,28 @@ async function handleActivateWithProof(req, res) {
   if (lead) {
     store.updateLeadStatus(lead.domain, lead.label, 'claimed');
   }
-  const record = await loadDomainRecord(domain);
-  const inboxHit =
-    record &&
-    Array.isArray(record.inboxes) &&
-    record.inboxes.find((row) => row.label === label);
+  const inboxHit = (await readInboxListFromEns(sdk, domain)).find((row) => row.label === label);
   const kind = (lead && lead.kind) || (inboxHit ? 'inbox' : 'lead');
   if (kind === 'inbox') {
+    const fullInboxName = `${label}.${domain}.global`;
+    try {
+      await withWalletQueue(async () => {
+        const sdk = await getSdk();
+        return appendClaimedInboxToEns(
+          sdk,
+          resolved.secondLevelInteractor,
+          domain,
+          label,
+          fullInboxName,
+        );
+      });
+    } catch (err) {
+      console.warn('[elead] inboxList ENS update failed', err.message);
+    }
     try {
       await upsertInbox(domain, {
         label,
-        fullName: `${label}.${domain}.global`,
+        fullName: fullInboxName,
         status: 'claimed',
       });
     } catch (err) {
@@ -1656,6 +2096,36 @@ async function dispatch(req, res) {
   }
   if (req.method === 'POST' && (action === 'setInboxRouting' || path.endsWith('/setInboxRouting'))) {
     return handleSetInboxRouting(req, res);
+  }
+  if (
+    req.method === 'GET' &&
+    (path.endsWith('/inboxFeed/lead') || action === 'getInboxFeedLead')
+  ) {
+    return handleGetInboxFeedLead(req, res);
+  }
+  if (
+    req.method === 'POST' &&
+    (path.endsWith('/inboxFeed/lead') || action === 'setInboxFeedLead')
+  ) {
+    return handlePostInboxFeedLead(req, res);
+  }
+  if (
+    req.method === 'GET' &&
+    (path.endsWith('/inboxFeed/summary') || action === 'getInboxFeedSummary')
+  ) {
+    return handleGetInboxFeedSummary(req, res);
+  }
+  if (
+    req.method === 'POST' &&
+    (path.endsWith('/inboxFeed/summary') || action === 'setInboxFeedSummary')
+  ) {
+    return handlePostInboxFeedSummary(req, res);
+  }
+  if (
+    req.method === 'GET' &&
+    (path.endsWith('/inboxFeeds') || action === 'listInboxFeeds')
+  ) {
+    return handleListInboxFeeds(req, res);
   }
   if (
     req.method === 'POST' &&
