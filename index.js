@@ -341,6 +341,24 @@ async function semaphoreInteractorFromEns(sdk, domain) {
   return ethers.utils.getAddress(value);
 }
 
+function normalizeInboxStatus(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase() === 'inactive'
+    ? 'inactive'
+    : 'active';
+}
+
+function serializeInboxList(rows) {
+  return JSON.stringify(
+    rows.map((row) => ({
+      label: row.label,
+      fullName: row.fullName,
+      status: normalizeInboxStatus(row.status),
+    })),
+  );
+}
+
 function parseInboxList(raw) {
   if (!raw) {
     return [];
@@ -359,6 +377,7 @@ function parseInboxList(raw) {
   for (const row of data) {
     let label = '';
     let fullName = '';
+    let status = 'active';
     if (typeof row === 'string') {
       fullName = row.trim().toLowerCase();
       if (!fullName.endsWith('.global')) {
@@ -380,12 +399,13 @@ function parseInboxList(raw) {
       if (!fullName && label) {
         fullName = `${label}.${String(row.domain || '').trim().toLowerCase()}.global`;
       }
+      status = normalizeInboxStatus(row.status);
     }
     if (!label || !fullName || seen.has(label)) {
       continue;
     }
     seen.add(label);
-    out.push({ label, fullName });
+    out.push({ label, fullName, status });
   }
   return out;
 }
@@ -399,17 +419,22 @@ async function readInboxListFromEns(sdk, domain) {
   }
 }
 
+async function writeInboxListToEns(sdk, sliAddr, domain, rows) {
+  const sli = new ethers.Contract(sliAddr, SLI_SET_TEXT_ABI, sdk.signer);
+  const tx = await sli.setText(domain, INBOX_LIST_KEY, serializeInboxList(rows));
+  await tx.wait();
+  return parseInboxList(serializeInboxList(rows));
+}
+
 async function appendClaimedInboxToEns(sdk, sliAddr, domain, label, fullName) {
   const current = await readInboxListFromEns(sdk, domain);
   const next = current.filter((row) => row.label !== label);
   next.push({
     label,
     fullName: String(fullName).toLowerCase(),
+    status: 'active',
   });
-  const sli = new ethers.Contract(sliAddr, SLI_SET_TEXT_ABI, sdk.signer);
-  const tx = await sli.setText(domain, INBOX_LIST_KEY, JSON.stringify(next));
-  await tx.wait();
-  return next;
+  return writeInboxListToEns(sdk, sliAddr, domain, next);
 }
 
 let cached;
@@ -1510,9 +1535,10 @@ async function handleGetInbox(req, res) {
   }
   const sdk = await getSdk();
   const fromEns = await readInboxListFromEns(sdk, domain);
-  const picked = fromEns.length > 0 ? fromEns[crypto.randomInt(fromEns.length)] : null;
+  const active = fromEns.filter((row) => normalizeInboxStatus(row.status) === 'active');
+  const picked = active.length > 0 ? active[crypto.randomInt(active.length)] : null;
   if (!picked) {
-    return jsonError(res, 404, `No inboxList entries for ${domain}`);
+    return jsonError(res, 404, `No active inboxList entries for ${domain}`);
   }
   return res.json({
     domain,
@@ -1534,6 +1560,63 @@ async function handleListInboxes(req, res) {
     receiveInbox: null,
     inboxes: ensInboxes,
     inboxList: ensInboxes,
+  });
+}
+
+async function handleSetInboxActive(req, res) {
+  const body = req.body || {};
+  const domain = normalizeDomain(body.domain);
+  const inboxName = normalizeDomain(body.inboxName);
+  const status = normalizeInboxStatus(body.status);
+  if (!DOMAIN_RE.test(domain)) {
+    return jsonError(res, 400, 'Invalid domain');
+  }
+  if (!DOMAIN_RE.test(inboxName)) {
+    return jsonError(res, 400, 'Invalid inboxName');
+  }
+  if (String(body.status || '').trim().toLowerCase() !== status) {
+    return jsonError(res, 400, 'status must be active or inactive');
+  }
+  try {
+    await requireSpSignature({
+      domain,
+      inboxLabel: inboxName,
+      timestamp: body.timestamp,
+      signature: body.signature,
+      kind: 'inbox',
+    });
+  } catch (err) {
+    return jsonError(res, 401, err && err.message ? err.message : err);
+  }
+  const sdk = await getSdk();
+  const ensInboxes = await readInboxListFromEns(sdk, domain);
+  const existing = ensInboxes.find((row) => row.label === inboxName);
+  if (!existing) {
+    return jsonError(res, 404, `${inboxFullName(domain, inboxName)} is not on inboxList`);
+  }
+  const next = ensInboxes.map((row) =>
+    row.label === inboxName ? { ...row, status } : row,
+  );
+  try {
+    const resolved = await resolveDomainOnChain(domain);
+    await withWalletQueue(async () => {
+      const queued = await getSdk();
+      return writeInboxListToEns(
+        queued,
+        resolved.secondLevelInteractor,
+        domain,
+        next,
+      );
+    });
+  } catch (err) {
+    return jsonError(res, 500, err && err.message ? err.message : err);
+  }
+  return res.json({
+    domain,
+    receiveMode: null,
+    receiveInbox: null,
+    inboxes: next,
+    inboxList: next,
   });
 }
 
@@ -2093,6 +2176,9 @@ async function dispatch(req, res) {
   }
   if (req.method === 'GET' && path.endsWith('/inboxes')) {
     return handleListInboxes(req, res);
+  }
+  if (req.method === 'POST' && (action === 'setInboxActive' || path.endsWith('/setInboxActive'))) {
+    return handleSetInboxActive(req, res);
   }
   if (req.method === 'POST' && (action === 'setInboxRouting' || path.endsWith('/setInboxRouting'))) {
     return handleSetInboxRouting(req, res);
