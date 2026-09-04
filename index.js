@@ -33,7 +33,6 @@ const DATA_DIR =
     ? path.join(os.tmpdir(), 'elead-data')
     : path.join(__dirname, 'data');
 const DOMAINS_FILE = path.join(DATA_DIR, 'domains.json');
-const LEADS_FILE = path.join(DATA_DIR, 'leads.json');
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) {
@@ -61,16 +60,8 @@ function loadDomains() {
   return readJson(DOMAINS_FILE, {});
 }
 
-function loadLeads() {
-  return readJson(LEADS_FILE, []);
-}
-
 function saveDomains(domains) {
   writeJson(DOMAINS_FILE, domains);
-}
-
-function saveLeads(leads) {
-  writeJson(LEADS_FILE, leads);
 }
 
 function getDomain(domain) {
@@ -97,54 +88,14 @@ function linkDomain({ domain, spAddress, semaphoreInteractor, secondLevelInterac
   return domains[domain];
 }
 
-function findLead({ label, domain }) {
-  const leads = loadLeads();
-  const needle = String(label || '').toLowerCase();
-  if (domain) {
-    return leads.find((row) => row.label === needle && row.domain === domain) || null;
-  }
-  return leads.find((row) => row.label === needle) || null;
-}
-
-function addLead(lead) {
-  const leads = loadLeads();
-  leads.push(lead);
-  saveLeads(leads);
-  return lead;
-}
-
 function listDomains() {
   return Object.values(loadDomains());
-}
-
-function leadsForDomain(domain) {
-  return loadLeads().filter((lead) => lead.domain === domain);
-}
-
-function leadsForSp(spAddress) {
-  const sp = String(spAddress || '').toLowerCase();
-  return loadLeads().filter((lead) => lead.spAddress === sp);
-}
-
-function updateLeadStatus(domain, label, status) {
-  const leads = loadLeads();
-  const lead = leads.find((row) => row.domain === domain && row.label === label);
-  if (!lead) return null;
-  lead.status = status;
-  lead.updatedAt = new Date().toISOString();
-  saveLeads(leads);
-  return lead;
 }
 
 const store = {
   getDomain,
   listDomains,
   linkDomain,
-  addLead,
-  findLead,
-  leadsForDomain,
-  leadsForSp,
-  updateLeadStatus,
 };
 
 let firestore;
@@ -645,14 +596,14 @@ function eleadSpHtmlUrl() {
   if (fromEnv) {
     return fromEnv.replace(/\/+$/, '');
   }
-  return `${eleadPagesRoot()}/sp-elead`;
+  return `${eleadPagesRoot()}/sp-aegis`;
 }
 
 function buildProductClientUrl({ isSp } = {}) {
   if (isSp) {
     return eleadSpHtmlUrl();
   }
-  return `${eleadPagesRoot()}/elead`;
+  return `${eleadPagesRoot()}/aegis`;
 }
 
 function eleadProductInfo() {
@@ -904,7 +855,7 @@ function normalizeDomain(value) {
 }
 
 function claimPageBase({ isSp } = {}) {
-  const product = isSp ? 'sp-elead' : 'elead';
+  const product = isSp ? 'sp-aegis' : 'aegis';
   const fromEnv = String(
     isSp
       ? process.env.CLAIM_PAGE_URL_SP || process.env.CLAIM_PAGE_URL || ''
@@ -932,7 +883,7 @@ function buildClaimUrl(userSecret, label, domain, { isSp } = {}) {
     params.set('dev', 'false');
   }
   const claimPage = `${claimPageBase({ isSp })}?${params.toString()}`;
-  const provider = process.env.CLAIM_PROVIDER || 'Elead';
+  const provider = process.env.CLAIM_PROVIDER || 'Aegis';
   return `arnacon://install?url=${encodeURIComponent(claimPage)}&provider=${encodeURIComponent(provider)}`;
 }
 
@@ -956,7 +907,7 @@ function jsonError(res, status, message) {
   return res.status(status).json({ error: text });
 }
 
-const INBOX_FEED_SCHEMA = 'elead.inbox.feed.v1';
+const INBOX_FEED_SCHEMA = 'aegis.inbox.feed.v1';
 const LEAD_STATUS_KEYS = ['pending', 'in_progress', 'done', 'expired'];
 
 function swarmBeeUrl() {
@@ -996,7 +947,7 @@ function recomputeLeadCounts(cases) {
 }
 
 function inboxFeedTopicText(domain, inboxLabel) {
-  return `elead:${inboxLabel}.${domain}.global`;
+  return `aegis:${inboxLabel}.${domain}.global`;
 }
 
 function inboxLabelFromInput(value, domain) {
@@ -1015,7 +966,7 @@ function inboxLabelFromInput(value, domain) {
 }
 
 function inboxFeedMessage(domain, inboxLabel, timestamp) {
-  return `elead-inbox-feed\n${domain}\n${inboxLabel}\n${timestamp}`;
+  return `aegis-inbox-feed\n${domain}\n${inboxLabel}\n${timestamp}`;
 }
 
 function toUtf8Maybe(value) {
@@ -1435,24 +1386,12 @@ async function handleGenerateLeadQR(req, res) {
   );
   const userSecret = inserted.userSecret;
 
-  const lead = store.addLead({
-    domain,
-    label,
-    kind: 'lead',
-    userSecret,
-    commitment: inserted.commitment,
-    insertTx: inserted.transactionHash,
-    spAddress: resolved.secondLevelController,
-    status: 'unclaimed',
-    createdAt: new Date().toISOString(),
-  });
-
   const url = buildClaimUrl(userSecret, label, domain, { isSp: false });
 
   return res.json({
     url,
-    label: lead.label,
-    domain: lead.domain,
+    label,
+    domain,
   });
 }
 
@@ -1485,9 +1424,6 @@ async function handleGenerateInboxQR(req, res) {
   if (existing) {
     return jsonError(res, 400, `Inbox ${inboxFullName(domain, inboxName)} already exists`);
   }
-  if (store.findLead({ label: inboxName, domain })) {
-    return jsonError(res, 400, `Label ${inboxName} is already used on ${domain}.global`);
-  }
 
   const resolved = await resolveDomainOnChain(domain);
   if (!resolved.semaphoreInteractor) {
@@ -1503,17 +1439,6 @@ async function handleGenerateInboxQR(req, res) {
   );
   const createdAt = new Date().toISOString();
   const fullName = inboxFullName(domain, inboxName);
-  store.addLead({
-    domain,
-    label: inboxName,
-    kind: 'inbox',
-    userSecret: inserted.userSecret,
-    commitment: inserted.commitment,
-    insertTx: inserted.transactionHash,
-    spAddress: resolved.secondLevelController,
-    status: 'unclaimed',
-    createdAt,
-  });
   try {
     await upsertInbox(domain, {
       label: inboxName,
@@ -1717,38 +1642,10 @@ async function handleFetchLeads(req, res) {
   const domainRaw = (req.query && req.query.domain) || (req.body && req.body.domain);
   const domain = domainRaw ? normalizeDomain(domainRaw) : '';
 
-  let rows;
-  if (domain) {
-    if (!DOMAIN_RE.test(domain)) {
-      return jsonError(res, 400, 'Invalid domain');
-    }
-    rows = store.leadsForDomain(domain);
-  } else if (ethers.utils.isAddress(sp)) {
-    rows = store.leadsForSp(sp);
-  } else {
+  if (!domain && !ethers.utils.isAddress(sp)) {
     return jsonError(res, 400, 'domain or sp is required');
   }
-  rows = rows.filter((row) => row.kind !== 'inbox');
-
-  const sdk = await getSdk();
-  const leads = [];
-  for (const row of rows) {
-    let chainStatus = '';
-    try {
-      chainStatus = await sdk.getRecord(statusKey(row.label), row.domain);
-    } catch (err) {
-      chainStatus = '';
-    }
-    leads.push({
-      domain: row.domain,
-      label: row.label,
-      status: chainStatus || row.status,
-      storeStatus: row.status,
-      createdAt: row.createdAt,
-      fullName: `${row.label}.${row.domain}.global`,
-    });
-  }
-  return res.json({ domain: domain || null, sp: sp || null, leads });
+  return res.json({ domain: domain || null, sp: sp || null, leads: [] });
 }
 
 async function deploySemaphoreInteractorWithoutGrant(sdk, secondLevelInteractor) {
@@ -1973,12 +1870,8 @@ async function handleGetGroupMembers(req, res) {
     .trim()
     .toLowerCase();
   let domain = domainHint;
-  if (!DOMAIN_RE.test(domain) && label) {
-    const lead = store.findLead({ label });
-    if (lead) domain = lead.domain;
-  }
   if (!DOMAIN_RE.test(domain)) {
-    return jsonError(res, 400, 'domain or label required to select Semaphore group');
+    return jsonError(res, 400, 'domain required to select Semaphore group');
   }
   const resolved = await resolveDomainOnChain(domain);
   if (!resolved.semaphoreInteractor) {
@@ -2026,8 +1919,7 @@ async function handleActivateWithProof(req, res) {
       'Could not resolve owner from web3identity (ENS) or owner 0x address',
     );
   }
-  const lead = store.findLead({ label, domain: domainHint || undefined });
-  let domain = domainHint || (lead && lead.domain) || '';
+  let domain = domainHint;
   if (!DOMAIN_RE.test(domain)) {
     return jsonError(res, 400, 'domain required (unknown label and no domain in body)');
   }
@@ -2047,24 +1939,39 @@ async function handleActivateWithProof(req, res) {
   }
 
   const parentName = domain;
-  const result = await withWalletQueue(() =>
-    withLinkedSemaphore(resolved, async (sdk) => {
-      const si = sdk.semaphore._getSemaphoreInteractor();
-      const tx = await sdk.semaphore.deploymentManager.executeTransaction(
-        si,
-        'registerSubnodeWithProof',
-        [proof, owner, parentName],
-        'Registering subnode with pre-generated ZK proof',
-      );
-      return { transactionHash: tx.hash };
-    }),
-  );
-
-  if (lead) {
-    store.updateLeadStatus(lead.domain, lead.label, 'claimed');
+  let result;
+  try {
+    result = await withWalletQueue(() =>
+      withLinkedSemaphore(resolved, async (sdk) => {
+        const si = sdk.semaphore._getSemaphoreInteractor();
+        console.log('[elead] activateWithProof', {
+          domain,
+          label,
+          owner,
+          si: si.address,
+          parentName,
+        });
+        const tx = await sdk.semaphore.deploymentManager.executeTransaction(
+          si,
+          'registerSubnodeWithProof',
+          [proof, owner, parentName],
+          'Registering subnode with pre-generated ZK proof',
+        );
+        console.log('[elead] registerSubnodeWithProof tx', tx.hash);
+        return { transactionHash: tx.hash };
+      }),
+    );
+  } catch (err) {
+    console.error(
+      '[elead] registerSubnodeWithProof failed',
+      err && err.message ? err.message : err,
+    );
+    return jsonError(res, 400, err && err.message ? err.message : err);
   }
+
+  const sdk = await getSdk();
   const inboxHit = (await readInboxListFromEns(sdk, domain)).find((row) => row.label === label);
-  const kind = (lead && lead.kind) || (inboxHit ? 'inbox' : 'lead');
+  const kind = inboxHit || !/^l[0-9a-f]{8}$/.test(label) ? 'inbox' : 'lead';
   if (kind === 'inbox') {
     const fullInboxName = `${label}.${domain}.global`;
     try {
@@ -2130,20 +2037,14 @@ async function handleSetLeadStatus(req, res) {
   if (!linked) {
     return jsonError(res, 400, `Domain ${domain} is not linked`);
   }
-  const existing = store.leadsForDomain(domain).find((row) => row.label === label);
-  if (!existing) {
-    return jsonError(res, 404, 'Lead not found');
-  }
 
   const sdk = await getSdk();
   await sdk.createRecord(statusKey(label), status, domain, linked.spAddress);
-  const updated = store.updateLeadStatus(domain, label, status);
   return res.json({
     domain,
     label,
     status,
     fullName: `${label}.${domain}.global`,
-    updatedAt: updated && updated.updatedAt,
   });
 }
 
